@@ -5,3 +5,4 @@
 # folder itself to move the demo, don't commit these.
 bin/
 models/
+.DS_Store
