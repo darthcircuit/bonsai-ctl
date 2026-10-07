@@ -1,14 +1,10 @@
-# Bonsai 2 27B — Portable Setup
+# bonsai-ctl 
+## A portable state manager for llama-server for portable Ternary Bonsai 2 27B. 
 
-A self-contained folder for running **Bonsai 2 27B** locally via a
-llama.cpp (`llama-server`) OpenAI-compatible background server, and launching
-**OpenCode** pointed at it. Copy the whole `portable/` folder to another Mac
-and it runs there with no download step.
-
+The goal of this project is to make it easy to configure and run Ternary Bonsai 2 27B on Mac.
+This script has only been tested on an **Apple Silicon Mac**
 ## Requirements
-
-- **Apple Silicon Mac** (arm64). The bundled `llama-server` and `libggml.*` are
-  arm64/Metal binaries only.
+- Mac or Linux system
 - **48 GB+ system RAM** recommended (the default runs full 262,144-token context).
 - **opencode** installed (for `bonsai-ctl launch opencode`):
   `curl -fsSL https://opencode.ai/install | bash`, or `brew install opencode`
@@ -18,7 +14,7 @@ and it runs there with no download step.
 | Path | What it is |
 |---|---|
 | `bonsai-ctl` | The control CLI (start/stop/status/launch) |
-| `setup.sh` | Creates the `~/.local/bin/bonsai-ctl` symlink. if `~/.local/bin` isn't on your PATH it prints the one line you add yourself. - Also downloads latest binaries for llama-server |
+| `setup.sh` | Creates the `~/.local/bin/bonsai-ctl` symlink. if `~/.local/bin` isn't on your PATH it prints the one line you add yourself. - Also downloads latest binaries for llama-server, and creates the models folder structure |
 | `config.env` | Server configuration — dot-sourced by `bonsai-ctl` |
 | `scripts/` | `start_llama_server.sh`, `common.sh`, `webui-config.json`, `download_binaries.sh` |
 
@@ -97,7 +93,7 @@ line in `config.env`.**
     so Bonsai is the default. (A project `opencode.json`, if you add one,
     still applies on top, per opencode's precedence.)
 
-  New tools (`hermes`, `pi`, …) go in the `launch_tool` case in `bonsai-ctl`.
+  No other harnesses have been added yet, but New tools (`hermes`, `pi`, …) will go in the `launch_tool` case in `bonsai-ctl`.
 
 ## Notes
 
