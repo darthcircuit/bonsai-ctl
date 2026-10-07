@@ -1,0 +1,443 @@
+#!/bin/sh
+# bonsai-ctl — control the portable Bonsai 2 server.
+#
+#   bonsai-ctl start             start the background server (idempotent)
+#   bonsai-ctl stop              stop the background server
+#   bonsai-ctl status            print state; exit 0 if up, 1 if down
+#   bonsai-ctl stats             tail the llama-server log (live; Ctrl-C stops)
+#   bonsai-ctl launch opencode   start the server if needed, open OpenCode
+#                                with the local Bonsai model as the default
+#   bonsai-ctl help              show this help
+#
+# Server settings live in config.env and are dot-sourced into this script:
+# every KEY=VALUE line becomes an exported variable. To change a value, edit
+# config.env and re-run. (Internal variables use the BCTRL_ prefix so config
+# keys can never collide with the script.)
+set -eu
+
+# ── Internal paths (BCTRL_ prefix → can't collide with config.env keys) ─────
+# Resolve the symlink chain in $0 first. When launched via
+# ~/.local/bin/bonsai-ctl (the setup.sh symlink), $0 is the link and
+# dirname() would yield ~/.local/bin, which does NOT contain this folder.
+# (Also handles $0 being a relative path like ./portable/bonsai-ctl.)
+SCRIPT="$0"
+while [ -L "$SCRIPT" ]; do
+    T="$(readlink "$SCRIPT" 2>/dev/null)" || break
+    [ -n "${T}" ] || break
+    case "${T}" in
+        /*) SCRIPT="${T}" ;;
+        *)  SCRIPT="$(cd "$(dirname "$SCRIPT")" && pwd -P)/${T}" ;;
+    esac
+done
+BCTRL_DIR="$(cd "$(dirname "${SCRIPT}")" && pwd -P)"
+BCTRL_CONFIG="${BCTRL_DIR}/config.env"
+BCTRL_RUNTIME="${BCTRL_DIR}/.runtime"
+BCTRL_PID="${BCTRL_RUNTIME}/server.pid"
+BCTRL_LOG="${BCTRL_RUNTIME}/server.log"
+
+# ── Dot-source config.env ─────────────────────────────────────────────────────
+# set -a makes every KEY=VALUE assignment export automatically, so the values
+# flow straight into the server launcher (which reads BONSAI_*/PORT env vars).
+if [ -f "${BCTRL_CONFIG}" ]; then
+    set -a
+    . "${BCTRL_CONFIG}"
+    set +a
+fi
+
+# ── Fill sensible defaults for any keys the file left unset ──────────────────
+PORT="${PORT:-8080}"
+BONSAI_HOST="${BONSAI_HOST:-127.0.0.1}"
+BONSAI_NGL="${BONSAI_NGL:-99}"
+BONSAI_CTX="${BONSAI_CTX:-262144}"
+BONSAI_KV4="${BONSAI_KV4:-0}"
+API_KEY="${API_KEY:-}"
+BONSAI_OUTPUT="${BONSAI_OUTPUT:-}"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+# Port used for the local /health probe (127.0.0.1 is always reachable when the
+# server binds to it; 0.0.0.0 also listens on loopback).
+health_host() {
+    case "${BONSAI_HOST}" in
+        0.0.0.0|::|::1) echo 127.0.0.1 ;;
+        *) echo "${BONSAI_HOST}" ;;
+    esac
+}
+
+health_url() {
+    printf 'http://%s:%s/health' "$(health_host)" "${PORT}"
+}
+
+is_up() {
+    if [ -n "${API_KEY:-}" ]; then
+        curl -fsS --max-time 3 -H "Authorization: Bearer ${API_KEY}" "$(health_url)" >/dev/null 2>&1
+    else
+        curl -fsS --max-time 3 "$(health_url)" >/dev/null 2>&1
+    fi
+}
+
+usage() {
+    cat <<EOF
+bonsai-ctl — control the portable Bonsai 2 server.
+
+Commands:
+  bonsai-ctl start             start the background server (idempotent)
+  bonsai-ctl stop              stop the background server
+  bonsai-ctl status            print state; exit 0 if up, 1 if down
+  bonsai-ctl stats             tail the llama-server log (live; Ctrl-C stops)
+  bonsai-ctl launch opencode   start the server if needed, open OpenCode
+                               with the local Bonsai model as the default
+  bonsai-ctl help              show this help
+
+Server settings: edit ${BCTRL_DIR}/config.env. It is dot-sourced, so each
+KEY=VALUE line becomes an exported variable. Useful keys:
+  BONSAI_HOST        server bind address (default 127.0.0.1)
+  PORT               server port; opencode's provider points here (default 8080)
+  BONSAI_NGL         GPU layers offloaded; 0 = CPU-only (default 99)
+  BONSAI_CTX         max tokens / context; also sets opencode's model context
+                     (default 262144)
+  BONSAI_KV4         1 = experimental 4-bit (Q4_0) KV cache → ~3.5x less KV RAM
+                     (slower decode; pair with ./scripts/make_kv_bias.sh)
+  BONSAI_REASONING_BUDGET  cap thinking in tokens; -1 or blank = uncapped
+  API_KEY            shared API key (llama-server + opencode + any harness);
+                     when set the server enforces it, blank = unauthenticated
+  BONSAI_OUTPUT      optional output token cap; sent to the server
+                     (--n-predict) and the local model's limit.output; blank = none
+EOF
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+start_server() {
+    mkdir -p "${BCTRL_RUNTIME}"
+    if is_up; then
+        echo "Bonsai server already running on :${PORT} (PID $(cat "${BCTRL_PID}" 2>/dev/null || echo '?'))."
+        return 0
+    fi
+
+    # Make sure the server-visible vars are exported for the launcher.
+    export PORT="${PORT}" BONSAI_HOST="${BONSAI_HOST}" BONSAI_NGL="${BONSAI_NGL}" \
+        BONSAI_CTX="${BONSAI_CTX}" BONSAI_KV4="${BONSAI_KV4}" \
+        API_KEY="${API_KEY:-}" BONSAI_OUTPUT="${BONSAI_OUTPUT:-}"
+
+    echo "Starting Bonsai 2 (host=${BONSAI_HOST} port=${PORT} ctx=${BONSAI_CTX} kv4=${BONSAI_KV4} ngl=${BONSAI_NGL}) ..."
+
+    # Optional: cap thinking with a reasoning budget (passed to llama-server).
+    EXTRA_ARGS=""
+    RB="${BONSAI_REASONING_BUDGET:-}"
+    case "${RB}" in
+        ""|-1) : ;;
+        *) EXTRA_ARGS=" ${EXTRA_ARGS} --reasoning-budget ${RB}" ;;
+    esac
+
+    nohup "${BCTRL_DIR}/scripts/start_llama_server.sh" ${EXTRA_ARGS} >"${BCTRL_LOG}" 2>&1 &
+    SERVER_PID=$!
+    printf '%s\n' "${SERVER_PID}" >"${BCTRL_PID}"
+
+    # Wait for /health (27B load is typically ~30-90s).
+    for i in $(seq 1 180); do
+        if is_up; then
+            echo "Bonsai server is up: $(health_url) (PID ${SERVER_PID})"
+            echo "  Log: ${BCTRL_LOG}"
+            return 0
+        fi
+        if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+            echo "Server process exited before becoming healthy (PID ${SERVER_PID})." >&2
+            tail -n 40 "${BCTRL_LOG}" >&2 || true
+            rm -f "${BCTRL_PID}"
+            return 1
+        fi
+        sleep 1
+    done
+    echo "Timed out waiting for the Bonsai server." >&2
+    tail -n 40 "${BCTRL_LOG}" >&2 || true
+    rm -f "${BCTRL_PID}"
+    return 1
+}
+
+stop_server() {
+    PID="$(cat "${BCTRL_PID}" 2>/dev/null || echo "")"
+    if [ -n "${PID}" ] && kill -0 "${PID}" 2>/dev/null; then
+        echo "Stopping Bonsai server (PID ${PID}) ..."
+        kill "${PID}" 2>/dev/null || true
+        sleep 3
+        if kill -0 "${PID}" 2>/dev/null; then
+            kill -9 "${PID}" 2>/dev/null || true
+        fi
+        rm -f "${BCTRL_PID}"
+        echo "Stopped."
+        return 0
+    fi
+
+    # Fallback: kill whatever is listening on the port (handles a stale PID file).
+    PIDS="$(lsof -ti TCP:${PORT} 2>/dev/null || true)"
+    if [ -n "${PIDS}" ]; then
+        echo "No live PID in file; stopping listener(s) on port ${PORT} (${PIDS})."
+        echo "${PIDS}" | xargs -r kill 2>/dev/null || true
+        sleep 3
+        PIDS="$(lsof -ti TCP:${PORT} 2>/dev/null || true)"
+        if [ -n "${PIDS}" ]; then
+            echo "${PIDS}" | xargs -r kill -9 2>/dev/null || true
+        fi
+        rm -f "${BCTRL_PID}" 2>/dev/null || true
+        echo "Stopped."
+        return 0
+    fi
+    echo "No Bonsai server running (nothing on port ${PORT})."
+    return 1
+}
+
+status_server() {
+    if is_up; then
+        echo "Bonsai server: UP on :${PORT} (PID $(cat "${BCTRL_PID}" 2>/dev/null || echo '?'))"
+        return 0
+    fi
+    echo "Bonsai server: DOWN (nothing on port ${PORT})"
+    return 1
+}
+
+# Show the llama-server's live output. start_server captures its stdout and
+# stderr into ${BCTRL_LOG}, so "tailing the log" IS "tailing the server's
+# stdout" — that is the portable way to do it on macOS (you can't separately
+# read another process's stdout once it has been redirected). A short recent
+# snapshot is shown up front, then it follows live (tail -F). Press Ctrl-C to
+# stop. Works with the server up (live) or just stopped (post-mortem read).
+stats_server() {
+    if [ ! -f "${BCTRL_LOG}" ]; then
+        if is_up; then
+            echo "Server is up but no log was written to ${BCTRL_LOG}." >&2
+            echo "(It may have been started without bonsai-ctl's log capture.)" >&2
+        else
+            echo "Bonsai server is not running (nothing on :${PORT})." >&2
+        fi
+        return 1
+    fi
+    if ! is_up; then
+        echo "Note: server is DOWN; showing its last log. (Ctrl-C to exit.)" >&2
+    fi
+    exec tail -F -n 50 "${BCTRL_LOG}"
+}
+
+# Merge the Bonsai provider + default model into the GLOBAL opencode config
+# (~/.config/opencode/opencode.json) so ANY opencode process — including the
+# long-lived background service the TUI connects to — can resolve the local
+# Bonsai model. The service reads its config once, at startup, so this is
+# what a process started earlier picks up.
+#
+# The Bonsai provider is the "merge dictionary" defined inline in this function
+# and parameterised from config.env — no local opencode.json to read or
+# maintain. Merge semantics (never clobber):
+#   * existing providers (e.g. oMLX) are kept untouched; only the "bonsai"
+#     entry is added/updated;
+#   * the last known-good file is backed up to opencode.json.bak.bonsai;
+#   * idempotent: if the entry already matches, the file is not touched.
+# Prints "changed" if the file was written, "unchanged" otherwise; returns
+# non-zero only if python3 is unavailable.
+update_opencode_global() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - \
+        "${BONSAI_HOST}" \
+        "${PORT}" \
+        "${BONSAI_CTX}" \
+        "${BONSAI_OUTPUT}" \
+        "${API_KEY}" \
+        <<'PY'
+import json
+import os
+import shutil
+import sys
+
+def strip_jsonc_comments(text):
+    """Drop // and /* */ comments outside strings (opencode accepts JSONC)."""
+    out, i, n = [], 0, len(text)
+    in_str = None
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+            i += 1
+        elif c in "\"'":
+            in_str = c
+            out.append(c)
+            i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+MODEL_ID = "bonsai-2-27b-pq2"
+PROVIDER_KEY = "bonsai"
+
+def to_int(v, dflt=None):
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return dflt
+
+def resolve_client_host(h):
+    # opencode runs locally, so always connect via loopback (unless an
+    # explicit non-loopback host was configured).
+    return "127.0.0.1" if (h or "") in ("", "0.0.0.0", "::", "::1") else (h or "127.0.0.1")
+
+def main():
+    host    = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    port    = to_int(sys.argv[2], 8080)   if len(sys.argv) > 2 else 8080
+    context = to_int(sys.argv[3], 262144) if len(sys.argv) > 3 else 262144
+    output  = to_int(sys.argv[4], None) if len(sys.argv) > 4 else None
+    api_key = sys.argv[5]                 if len(sys.argv) > 5 else ""
+
+    # The merge dictionary, built from config.env (the source of truth).
+    settings = {"baseURL": "http://%s:%d/v1" % (resolve_client_host(host), port)}
+    if api_key:
+        settings["apiKey"] = api_key
+    limit = {"context": context}
+    if output is not None:
+        limit["output"] = output
+    provider = {
+        "name": "Bonsai 2 27B (local)",
+        "package": "@opencode/ai/providers/openai-compatible",
+        "settings": settings,
+        "models": {
+            MODEL_ID: {
+                "name": "Bonsai 2 27B PQ2_0 (local)",
+                "capabilities": {"tools": True, "input": ["text"], "output": ["text"]},
+                "limit": limit,
+            }
+        },
+    }
+
+    global_path = os.path.expanduser("~/.config/opencode/opencode.json")
+    data = {}
+    existing = os.path.exists(global_path)
+    if existing:
+        with open(global_path, "r", encoding="utf-8") as f:
+            data = json.loads(strip_jsonc_comments(f.read()))
+    if not existing:
+        data["$schema"] = "https://opencode.ai/config.json"
+
+    # v1 configs (oMLX-era) use a singular "provider" key; current configs
+    # use "providers". Merge into whichever is present (prefer v2 plural),
+    # leaving every other provider untouched.
+    if "providers" in data:
+        providers = data["providers"]
+    elif "provider" in data:
+        providers = data["provider"]
+    else:
+        providers = data.setdefault("providers", {})
+    changed = providers.get(PROVIDER_KEY) != provider
+    providers[PROVIDER_KEY] = provider
+
+    new_model = PROVIDER_KEY + "/" + MODEL_ID
+    model_changed = data.get("model") != new_model
+    data["model"] = new_model
+
+    if changed or model_changed:
+        if existing:
+            shutil.copyfile(global_path, global_path + ".bak.bonsai")
+        os.makedirs(os.path.dirname(global_path), exist_ok=True)
+        with open(global_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        print("changed")
+    else:
+        print("unchanged")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY
+}
+
+# Launch a tool pointed at the local server. Add new tools below (e.g. hermes, pi).
+launch_tool() {
+    if [ $# -lt 1 ]; then
+        echo "Usage: bonsai-ctl launch <tool>" >&2
+        echo "  Supported tools: opencode" >&2
+        return 1
+    fi
+    TOOL="$1"
+    shift
+    case "${TOOL}" in
+        opencode)
+            # Ensure the server is running with the configured settings.
+            start_server
+
+            if ! command -v opencode >/dev/null 2>&1; then
+                echo "opencode not found in PATH. Install with:" >&2
+                echo "  curl -fsSL https://opencode.ai/install | bash" >&2
+                return 1
+            fi
+
+            # Scrub app-specific Python env vars (as oMLX does when launching
+            # tools) so the launched process doesn't inherit them.
+            unset PYTHONHOME PYTHONPATH PYTHONDONTWRITEBYTECODE 2>/dev/null || true
+
+            # Merge the Bonsai provider + default model (built as an in-script
+            # dictionary from config.env) into the GLOBAL opencode config. Never
+            # clobbers existing providers (e.g. oMLX); last known-good is kept
+            # at opencode.json.bak.bonsai.
+            #
+            # The service loads its config only at startup, so a changed file
+            # needs a service restart to take effect — only happens when the
+            # config just changed (first launch, or a config.env edit). Steady
+            # -state launches are no-ops (no restart).
+            if MERGE=$(update_opencode_global); then
+                if [ "${MERGE}" = "changed" ]; then
+                    echo "  Merged Bonsai into global opencode config; restarting the opencode service so it picks it up."
+                    opencode service restart >/dev/null 2>&1 || opencode service start >/dev/null 2>&1 || true
+                fi
+            else
+                echo "Warning: could not merge Bonsai into the global opencode config (missing python3?)." >&2
+                echo "The local Bonsai model may not resolve inside OpenCode — check ~/.config/opencode/opencode.json." >&2
+            fi
+
+            # No cd: OpenCode runs in whatever directory the user invoked this
+            # from (their project), and the local provider comes from the
+            # merged global config — not a cwd-specific file. Any project
+            # opencode.json (if present) still applies on top, per opencode's
+            # precedence (project > global).
+            exec opencode "$@"
+            ;;
+        *)
+            echo "Unknown tool: ${TOOL}" >&2
+            echo "Supported: opencode" >&2
+            return 1
+            ;;
+    esac
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+if [ $# -ge 1 ]; then
+    CMD="$1"
+    shift
+else
+    CMD=""
+fi
+
+case "${CMD}" in
+    start)      start_server ;;
+    stop)       stop_server ;;
+    status)     status_server ;;
+    stats)      stats_server ;;
+    launch)     launch_tool "$@" ;;
+    help|-h|--help) usage ;;
+    "")         usage ;;
+    *)
+        echo "Unknown command: ${CMD}" >&2
+        echo "" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

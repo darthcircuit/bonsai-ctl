@@ -1,0 +1,7 @@
+# Runtime state (PID files, server log).
+.runtime/
+
+# Bundled binaries and model weights — machine-specific and large; copy the
+# folder itself to move the demo, don't commit these.
+bin/
+models/
