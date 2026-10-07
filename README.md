@@ -11,27 +11,35 @@ and it runs there with no download step.
   arm64/Metal binaries only.
 - **48 GB+ system RAM** recommended (the default runs full 262,144-token context).
 - **opencode** installed (for `bonsai-ctl launch opencode`):
-  `curl -fsSL https://opencode.ai/install | bash`
+  `curl -fsSL https://opencode.ai/install | bash`, or `brew install opencode`
 
 ## What's inside
 
 | Path | What it is |
 |---|---|
 | `bonsai-ctl` | The control CLI (start/stop/status/launch) |
-| `setup.sh` | Creates the `~/.local/bin/bonsai-ctl` symlink. It never modifies your shell rc; if `~/.local/bin` isn't on your PATH it prints the one line you add yourself. |
+| `setup.sh` | Creates the `~/.local/bin/bonsai-ctl` symlink. if `~/.local/bin` isn't on your PATH it prints the one line you add yourself. - Also downloads latest binaries for llama-server |
 | `config.env` | Server configuration — dot-sourced by `bonsai-ctl` |
-| `bin/mac/` | PrismML llama.cpp fork — `llama-server` + `libggml.*` (~29 MB) |
-| `models/bonsai2-gguf/27B/` | Bonsai 2 27B `PQ2_0` GGUF (~8.2 GB) + vision projector (~0.6 GB) |
-| `scripts/` | `start_llama_server.sh`, `common.sh`, `webui-config.json` (from the repo) |
+| `scripts/` | `start_llama_server.sh`, `common.sh`, `webui-config.json`, `download_binaries.sh` |
 
 ## Quick start
-
 ```sh
-cd portable
-./setup.sh                 # puts bonsai-ctl on your PATH (run in a new shell)
-bonsai-ctl launch opencode # one command: starts the server + opens OpenCode (Bonsai default)
-```
+# clone repo and cd into folder
+git clone https://github.com/darthcircuit/bonsai-ctl && cd bonsai-ctl
 
+# puts bonsai-ctl on your PATH ./(run in a new shell) and downloads llama-server
+./setup.sh
+```
+Download the Model files from HF: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf, and copy them into the created models/bonsai2-gguf/27B folder
+
+When complete, your folder structure should look like this:
+
+![](structure.png)
+---
+You can pre-configure and launch OpenCode directly:
+```sh
+bonsai-ctl launch opencode  # one command: starts the server + opens OpenCode (Bonsai default)
+```
 Or run the pieces individually:
 
 ```sh
@@ -39,7 +47,6 @@ bonsai-ctl start           # start the background server (idempotent)
 bonsai-ctl status          # print state (exit 0 if up, 1 if down)
 bonsai-ctl stats           # tail the llama-server log (live; Ctrl-C to stop)
 bonsai-ctl stop            # stop the server
-
 bonsai-ctl help            # usage
 ```
 
@@ -51,11 +58,12 @@ line in `config.env`.**
 
 | Key | Meaning | Default |
 |---|---|---|
-| `BONSAI_HOST` | Server bind address | `127.0.0.1` |
+| `BONSAI_HOST` | Server bind address (Set to 0.0.0.0 for access outside of localhost) | `127.0.0.1` |
 | `PORT` | Server port; opencode's provider points here | `8080` |
 | `BONSAI_NGL` | GPU layers offloaded; `0` = CPU-only | `99` |
-| `BONSAI_CTX` | Max context tokens; also sets opencode's Bonsai model context | `262144` |
-| `BONSAI_KV4` | `1` = experimental 4-bit (Q4_0) KV cache → ~3.5x less KV RAM (slower decode). Pair with `./scripts/make_kv_bias.sh` for best quality. | `0` |
+| `BONSAI_CTX` | Max context tokens; also sets opencode's Bonsai model context | `131072` |
+| `BONSAI_VISION` | `1` = load the vision projector → image input in server + opencode; `0` = text-only | `1` |
+| `BONSAI_KV4` | `1` = experimental 4-bit (Q4_0) KV cache → ~3.5x less KV RAM (slower decode). Pair with `./scripts/make_kv_bias.sh` for best quality. | `1` |
 | `BONSAI_REASONING_BUDGET` | Cap thinking in tokens; `-1` or blank = uncapped | blank |
 | `API_KEY` | Shared API key — sent to llama-server and any harness (opencode, future launchers). When set the server enforces it; blank = unauthenticated | blank |
 | `BONSAI_OUTPUT` | Optional output token cap (tokens); sent to llama-server (`--n-predict`) and the local Bonsai model's `limit.output`. Left blank, no cap is applied | blank |
@@ -100,8 +108,3 @@ line in `config.env`.**
   Bonsai (`~/.config/opencode/opencode.json`, merged, oMLX etc. untouched).
   Existing OpenCode sessions are unaffected; remove Bonsai from the global
   config manually if you want the previous default.
-- **Not for git:** `bin/` + `models/` (~8.8 GB combined, arm64 binaries + model
-  weights) are excluded by `portable/.gitignore`, along with `.runtime/`. The
-  git-tracked files are the scripts, config, and docs; copy the whole folder
-  (or re-download the binaries/weights per [Requirements](#requirements)) to
-  move the demo to another Mac.

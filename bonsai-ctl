@@ -52,6 +52,7 @@ BONSAI_CTX="${BONSAI_CTX:-262144}"
 BONSAI_KV4="${BONSAI_KV4:-0}"
 API_KEY="${API_KEY:-}"
 BONSAI_OUTPUT="${BONSAI_OUTPUT:-}"
+BONSAI_VISION="${BONSAI_VISION:-1}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 # Port used for the local /health probe (127.0.0.1 is always reachable when the
@@ -95,6 +96,8 @@ KEY=VALUE line becomes an exported variable. Useful keys:
   BONSAI_NGL         GPU layers offloaded; 0 = CPU-only (default 99)
   BONSAI_CTX         max tokens / context; also sets opencode's model context
                      (default 262144)
+  BONSAI_VISION       1 = load the projector -> image input in server + opencode
+                     (default 1); 0 = text-only
   BONSAI_KV4         1 = experimental 4-bit (Q4_0) KV cache → ~3.5x less KV RAM
                      (slower decode; pair with ./scripts/make_kv_bias.sh)
   BONSAI_REASONING_BUDGET  cap thinking in tokens; -1 or blank = uncapped
@@ -108,15 +111,29 @@ EOF
 # ── Commands ──────────────────────────────────────────────────────────────────
 start_server() {
     mkdir -p "${BCTRL_RUNTIME}"
+
+    # The settings that decide what the server actually runs with. A running
+    # server can't pick up a change mid-flight (e.g. enabling/disabling the
+    # projector), so if the profile stored at the last start differs from the
+    # current one we restart first. A fresh start records this signature.
+    server_sig_file="${BCTRL_RUNTIME}/server.sig"
+    sig="$(printf '%s|%s|%s|%s|%s|%s|%s|%s' "${BONSAI_MODEL:-27B}" "${BONSAI_FAMILY:-bonsai2}" \
+        "${BONSAI_HOST}" "${PORT}" "${BONSAI_NGL}" "${BONSAI_CTX}" "${BONSAI_KV4}" "${BONSAI_VISION}")"
+
     if is_up; then
-        echo "Bonsai server already running on :${PORT} (PID $(cat "${BCTRL_PID}" 2>/dev/null || echo '?'))."
-        return 0
+        stored="$(cat "${server_sig_file}" 2>/dev/null)"
+        if [ "${stored:-}" = "${sig}" ]; then
+            echo "Bonsai server already running on :${PORT} (PID $(cat "${BCTRL_PID}" 2>/dev/null || echo '?'))."
+            return 0
+        fi
+        echo "Server settings changed since the last start; restarting to apply them." >&2
+        stop_server
     fi
 
     # Make sure the server-visible vars are exported for the launcher.
     export PORT="${PORT}" BONSAI_HOST="${BONSAI_HOST}" BONSAI_NGL="${BONSAI_NGL}" \
         BONSAI_CTX="${BONSAI_CTX}" BONSAI_KV4="${BONSAI_KV4}" \
-        API_KEY="${API_KEY:-}" BONSAI_OUTPUT="${BONSAI_OUTPUT:-}"
+        BONSAI_VISION="${BONSAI_VISION:-1}" API_KEY="${API_KEY:-}" BONSAI_OUTPUT="${BONSAI_OUTPUT:-}"
 
     echo "Starting Bonsai 2 (host=${BONSAI_HOST} port=${PORT} ctx=${BONSAI_CTX} kv4=${BONSAI_KV4} ngl=${BONSAI_NGL}) ..."
 
@@ -137,6 +154,7 @@ start_server() {
         if is_up; then
             echo "Bonsai server is up: $(health_url) (PID ${SERVER_PID})"
             echo "  Log: ${BCTRL_LOG}"
+            printf '%s\n' "${sig}" >"${server_sig_file}"
             return 0
         fi
         if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
@@ -239,6 +257,7 @@ update_opencode_global() {
         "${BONSAI_CTX}" \
         "${BONSAI_OUTPUT}" \
         "${API_KEY}" \
+        "${BONSAI_VISION:-1}" \
         <<'PY'
 import json
 import os
@@ -297,6 +316,7 @@ def main():
     context = to_int(sys.argv[3], 262144) if len(sys.argv) > 3 else 262144
     output  = to_int(sys.argv[4], None) if len(sys.argv) > 4 else None
     api_key = sys.argv[5]                 if len(sys.argv) > 5 else ""
+    vision  = to_int(sys.argv[6], 1) if len(sys.argv) > 6 else 1
 
     # The merge dictionary, built from config.env (the source of truth).
     settings = {"baseURL": "http://%s:%d/v1" % (resolve_client_host(host), port)}
@@ -312,7 +332,7 @@ def main():
         "models": {
             MODEL_ID: {
                 "name": "Bonsai 2 27B PQ2_0 (local)",
-                "capabilities": {"tools": True, "input": ["text"], "output": ["text"]},
+                "capabilities": {"tools": True, "input": ["text", "image"] if vision else ["text"], "output": ["text"]},
                 "limit": limit,
             }
         },

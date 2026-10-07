@@ -15,6 +15,9 @@ cd "$DEMO_DIR"
 HOST="${BONSAI_HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
 
+# Vision (image input): 1 = load the projector and accept images, 0 = text-only.
+BONSAI_VISION="${BONSAI_VISION:-1}"
+
 # ── Check port is free ──
 if curl -s --max-time 2 "http://localhost:$PORT/health" >/dev/null 2>&1; then
     warn "llama-server is already running on port $PORT."
@@ -47,11 +50,19 @@ if [ -n "${BONSAI_GGUF:-}" ]; then
         err "BONSAI_GGUF=$BONSAI_GGUF does not exist."
         exit 1
     fi
+    # Vision: an explicit BONSAI_MMPROJ applies as always (a deliberate choice).
+    # When BONSAI_VISION=1 and no explicit projector is given, the model dir
+    # is searched for one, so the bundled 27B projector loads by default.
     MMPROJ="${BONSAI_MMPROJ:-}"
+    if [ -z "$MMPROJ" ] && [ "$BONSAI_VISION" = "1" ]; then
+        for _mp in "$(dirname "$MODEL")"/*mmproj*.gguf; do
+            [ -f "$_mp" ] && MMPROJ="$_mp" && break
+        done
+    fi
     if [ -n "$MMPROJ" ]; then
         case "$MMPROJ" in /*) ;; *) MMPROJ="$DEMO_DIR/$MMPROJ" ;; esac
         if [ ! -f "$MMPROJ" ]; then
-            err "BONSAI_MMPROJ=$BONSAI_MMPROJ does not exist."
+            err "BONSAI_MMPROJ=$MMPROJ does not exist."
             exit 1
         fi
     fi
@@ -70,14 +81,15 @@ else
     fi
     MODEL="$DEMO_DIR/$MODEL"
 
-    # ── Vision: use the multimodal projector when present (27B is a VLM) ──
+    # ── Vision: use the multimodal projector when enabled (27B is a VLM) ──
     MMPROJ=""
-    for _mp in $GGUF_MODEL_DIR/*mmproj*.gguf; do
-        [ -f "$_mp" ] && MMPROJ="$DEMO_DIR/$_mp" && break
-    done
-    if [ "$BONSAI_MODEL" = "27B" ] && [ -z "$MMPROJ" ]; then
-        warn "No mmproj file found in ${GGUF_MODEL_DIR}/ — image input disabled."
-        echo "  Re-run ./scripts/download_models.sh to fetch it."
+    if [ "$BONSAI_VISION" = "1" ]; then
+        for _mp in $GGUF_MODEL_DIR/*mmproj*.gguf; do
+            [ -f "$_mp" ] && MMPROJ="$DEMO_DIR/$_mp" && break
+        done
+        if [ -z "$MMPROJ" ]; then
+            warn "BONSAI_VISION=1 but no mmproj file found in ${GGUF_MODEL_DIR}/ — image input unavailable. Re-run ./scripts/download_models.sh to fetch it (or set BONSAI_VISION=0 for text-only)."
+        fi
     fi
     _full_profile=0
     if [ "$BONSAI_MODEL" = "27B" ]; then

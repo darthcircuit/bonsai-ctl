@@ -19,6 +19,12 @@ chmod +x "${CTL}"
 
 mkdir -p "${BIN_DIR}"
 
+echo Downloading Prism Lllama Server Binaries
+./scripts/download_binaries.sh
+
+echo Creating Models Folder Structure
+mkdir -p models/bonsai2-gguf/27B
+
 # Replace an existing symlink or stale file with a fresh link to this copy.
 [ -L "${BIN_DIR}/bonsai-ctl" ] && rm -f "${BIN_DIR}/bonsai-ctl"
 [ -f "${BIN_DIR}/bonsai-ctl" ] && rm -f "${BIN_DIR}/bonsai-ctl"
